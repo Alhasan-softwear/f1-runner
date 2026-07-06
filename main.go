@@ -17,9 +17,10 @@ import (
 	"github.com/Alhasan-softwear/f1-runner/internal/deploy"
 	"github.com/Alhasan-softwear/f1-runner/internal/provision"
 	"github.com/Alhasan-softwear/f1-runner/internal/ui"
+	"github.com/Alhasan-softwear/f1-runner/internal/webui"
 )
 
-var version = "0.2.0"
+var version = "0.3.0"
 
 const usage = `f1 %s — deploy a monorepo to one or many servers
 
@@ -34,6 +35,7 @@ Usage on your machine (needs f1.yml in the current directory):
   f1 env set <comp> K=V …      set server-side secrets   [--server S]
   f1 env unset <comp> K …      remove keys               [--server S]
   f1 env show <comp>           print the env file        [--server S]
+  f1 ui                        web dashboard             [--listen 127.0.0.1:9100] [--token T]
   f1 version
 
 On servers (run automatically over SSH; also usable manually or from cron):
@@ -68,6 +70,8 @@ func main() {
 		err = cmdEnv(os.Args[2:])
 	case "agent":
 		err = cmdAgent(os.Args[2:])
+	case "ui":
+		err = cmdUI(os.Args[2:])
 	case "provision":
 		err = cmdProvision(os.Args[2:])
 	case "version", "--version", "-v":
@@ -292,6 +296,18 @@ func cmdAgent(args []string) error {
 	return agent.Run(agent.Options{
 		Root: *root, RepoURL: *repo, Branch: *branch, Listen: *listen, Token: *token, Components: comps,
 	})
+}
+
+func cmdUI(args []string) error {
+	fs := flag.NewFlagSet("ui", flag.ExitOnError)
+	listen := fs.String("listen", "127.0.0.1:9100", "listen address (non-loopback requires --token)")
+	tok := fs.String("token", os.Getenv("F1_UI_TOKEN"), "auth token (or F1_UI_TOKEN); required off-loopback")
+	cfgPath := fs.String("config", "f1.yml", "path to the root config")
+	fs.Parse(args)
+	if _, err := loadRoot(*cfgPath); err != nil {
+		return err
+	}
+	return webui.Run(webui.Options{ConfigPath: *cfgPath, Listen: *listen, Token: *tok})
 }
 
 func cmdProvision(args []string) error {

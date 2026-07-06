@@ -66,6 +66,7 @@ f1 status                      # merged table across all servers
 f1 logs api -f                 # follow logs (compose logs / $F1_LOG / scripts.logs)
 f1 rollback web                # instant flip to the previous release
 f1 env set api DB_PASS=s3cret  # server-side secrets, never in the repo
+f1 ui                          # web dashboard at http://127.0.0.1:9100
 ```
 
 ## Root f1.yml
@@ -187,6 +188,30 @@ Compose publishes `"${F1_PORT}:80"`. Each deploy goes to the *inactive* slot's p
 must pass health there, then the switch hook runs (gets `F1_PORT`, `F1_OLD_PORT`,
 `F1_SLOT`) and the old slot is stopped. A failed deploy never touches the live slot.
 Point your reverse proxy at both ports (or switch it in the hook).
+
+## Web dashboard — f1 ui
+
+A Coolify-style control panel, embedded in the binary (no extra install):
+
+```sh
+cd your-monorepo
+f1 ui                                    # http://127.0.0.1:9100
+f1 ui --listen 0.0.0.0:9100 --token SECRET   # exposed = token required
+```
+
+- Component cards with per-server status (sha, release age, slot, failures with the
+  error on hover), runtime/blue-green badges, and dependency chips.
+- **Deploy** / **Deploy all** buttons (with ref + force controls), **Rollback**,
+  live-streamed deploy logs in a terminal drawer (Server-Sent Events), and an
+  activity history of recent runs.
+- **Env editor**: view, set, and unset per-component secrets on any server.
+- **Logs viewer** for running components.
+- Server sidebar with reachability dots.
+
+Every action shells out to the same CLI commands (`f1 deploy`, `f1 rollback`,
+`f1 env`, `f1 logs`), so the dashboard can't drift from CLI behavior; deploys are
+serialized. Run it on your machine, or on a bastion with `--token` (it refuses to
+bind beyond loopback without one — it can deploy and read secrets).
 
 ## Webhook / CI agent mode
 

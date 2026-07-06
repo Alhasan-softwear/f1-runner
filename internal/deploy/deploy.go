@@ -5,8 +5,10 @@ package deploy
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -164,23 +166,27 @@ func serversFor(cfg *config.Root, comp, serverFilter string) ([]string, error) {
 	return nil, fmt.Errorf("component %q is not assigned to server %q (its servers: %s)", comp, serverFilter, strings.Join(def.Servers, ", "))
 }
 
-// Status fetches state.json from every server and prints one merged table.
-func Status(cfg *config.Root, serverFilter string) error {
+// StatusRow is one component's state on one server.
+type StatusRow struct {
+	Server    string                 `json:"server"`
+	Component string                 `json:"component"`
+	State     release.ComponentState `json:"state"`
+}
+
+// FetchStatus reads state.json from every server in parallel. Unreachable
+// servers are reported by name rather than failing the whole call.
+func FetchStatus(cfg *config.Root, serverFilter string) ([]StatusRow, []string, error) {
 	if err := sshx.CheckBinaries(); err != nil {
-		return err
+		return nil, nil, err
 	}
 	names := cfg.ServerNames()
 	if serverFilter != "" {
 		if _, ok := cfg.Servers[serverFilter]; !ok {
-			return fmt.Errorf("unknown server %q (defined: %s)", serverFilter, strings.Join(names, ", "))
+			return nil, nil, fmt.Errorf("unknown server %q (defined: %s)", serverFilter, strings.Join(names, ", "))
 		}
 		names = []string{serverFilter}
 	}
-	type row struct {
-		server, comp string
-		cs           release.ComponentState
-	}
-	var rows []row
+	var rows []StatusRow
 	var unreachable []string
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -190,7 +196,7 @@ func Status(cfg *config.Root, serverFilter string) error {
 		go func(sv string, target sshx.Target) {
 			defer wg.Done()
 			cmd := target.RemoteCmd([]string{target.Server.F1Bin(), "status", "--local", "--json", "--root", target.Server.Root})
-			outStr, err := target.Output(cmd, ui.NewPrefix(sv))
+			outStr, err := target.Output(cmd, io.Discard)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -203,24 +209,33 @@ func Status(cfg *config.Root, serverFilter string) error {
 				return
 			}
 			for comp, cs := range st.Components {
-				rows = append(rows, row{sv, comp, cs})
+				rows = append(rows, StatusRow{sv, comp, cs})
 			}
 		}(sv, target)
 	}
 	wg.Wait()
+	sort.Strings(unreachable)
+	return sortedRows(rows, func(r StatusRow) string { return r.Server + "/" + r.Component }), unreachable, nil
+}
 
+// Status fetches state.json from every server and prints one merged table.
+func Status(cfg *config.Root, serverFilter string) error {
+	rows, unreachable, err := FetchStatus(cfg, serverFilter)
+	if err != nil {
+		return err
+	}
 	if len(rows) == 0 {
 		ui.Printf("nothing deployed yet")
 	} else {
 		ui.Printf("%-14s %-16s %-8s %-28s %-9s %-11s %s", "SERVER", "COMPONENT", "STATUS", "RELEASE", "SHA", "SLOT", "DEPLOYED")
-		for _, r := range sortedRows(rows, func(r row) string { return r.server + "/" + r.comp }) {
-			status := r.cs.Status
+		for _, r := range rows {
+			status := r.State.Status
 			if status == "failed" {
 				status = ui.Red(status)
 			} else {
 				status = ui.Green(status)
 			}
-			ui.Printf("%-14s %-16s %-8s %-28s %-9s %-11s %s", r.server, r.comp, status, orDash(r.cs.Release), release.ShortSha(r.cs.Sha), slotLabel(r.cs), release.Ago(r.cs.DeployedAt))
+			ui.Printf("%-14s %-16s %-8s %-28s %-9s %-11s %s", r.Server, r.Component, status, orDash(r.State.Release), release.ShortSha(r.State.Sha), slotLabel(r.State), release.Ago(r.State.DeployedAt))
 		}
 	}
 	if len(unreachable) > 0 {
