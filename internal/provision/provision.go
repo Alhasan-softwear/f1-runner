@@ -31,9 +31,11 @@ func svc(name string) string {
 
 var recipes = map[string]recipe{
 	"python": {
-		check: "command -v python3 && python3 -m venv --help >/dev/null",
+		// --help passes even when ensurepip is missing, so actually create a
+		// throwaway venv: that is what fails on a bare Ubuntu python3.
+		check: `command -v python3 && python3 -c 'import venv,ensurepip' && d=$(mktemp -d) && python3 -m venv "$d/v" >/dev/null 2>&1; rc=$?; rm -rf "$d"; [ $rc -eq 0 ]`,
 		pkgs: map[string][]string{
-			"apt": {"python3", "python3-pip", "python3-venv"},
+			"apt": {"python3", "python3-pip", "python3-venv", "python3-dev"},
 			"apk": {"python3", "py3-pip"},
 			"dnf": {"python3", "python3-pip"},
 		},
@@ -256,17 +258,21 @@ func Ensure(specs []string, out io.Writer) error {
 		fmt.Fprintf(out, "%s: installing (%s)…\n", name, manager)
 
 		pre := r.pre[manager]
-		// node@<major>: pin via NodeSource on apt/dnf.
+		pkgs := r.pkgs[manager]
+		// node@<major>: pin via NodeSource on apt/dnf. Its nodejs package
+		// bundles npm and CONFLICTS with the distro npm package, so install
+		// nodejs alone here.
 		if name == "node" && version != "" && manager != "apk" {
 			pre = []string{fmt.Sprintf("curl -fsSL https://deb.nodesource.com/setup_%s.x | bash -", version)}
 			if manager == "dnf" {
 				pre = []string{fmt.Sprintf("curl -fsSL https://rpm.nodesource.com/setup_%s.x | bash -", version)}
 			}
+			pkgs = []string{"nodejs"}
 		} else if version != "" {
 			fmt.Fprintf(out, "%s: note — version pinning (@%s) is only honored for node on apt/dnf; installing the distro version\n", name, version)
 		}
 
-		if !updated && (len(r.pkgs[manager]) > 0 || len(pre) > 0) {
+		if !updated && (len(pkgs) > 0 || len(pre) > 0) {
 			run(updateCmd(manager)) // best effort
 			updated = true
 		}
@@ -278,8 +284,8 @@ func Ensure(specs []string, out io.Writer) error {
 				break
 			}
 		}
-		if ok && len(r.pkgs[manager]) > 0 {
-			if err := run(installCmd(manager, r.pkgs[manager])); err != nil {
+		if ok && len(pkgs) > 0 {
+			if err := run(installCmd(manager, pkgs)); err != nil {
 				fmt.Fprintf(out, "%s: install failed: %v\n", name, err)
 				ok = false
 			}

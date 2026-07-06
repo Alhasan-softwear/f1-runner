@@ -20,7 +20,7 @@ import (
 	"github.com/Alhasan-softwear/f1-runner/internal/webui"
 )
 
-var version = "0.3.1"
+var version = "0.3.2"
 
 const usage = `f1 %s — deploy a monorepo to one or many servers
 
@@ -119,8 +119,10 @@ func cmdDeploy(args []string) error {
 	force := fs.Bool("force", false, "deploy even if nothing changed")
 	dryRun := fs.Bool("dry-run", false, "show what would happen without changing anything")
 	cfgPath := fs.String("config", "f1.yml", "path to the root config")
-	fs.Parse(args)
-	comps := fs.Args()
+	// Accept components and flags in any order (f1 deploy app --force).
+	comps, rest := splitLeadingArgs(args)
+	fs.Parse(rest)
+	comps = append(comps, fs.Args()...)
 	if !*all && len(comps) == 0 {
 		return fmt.Errorf("name components to deploy, or use --all")
 	}

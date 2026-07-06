@@ -1,5 +1,5 @@
 # f1 runner build targets
-VERSION := 0.3.1
+VERSION := 0.3.2
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .PHONY: build dist test clean
