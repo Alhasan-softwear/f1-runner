@@ -70,6 +70,27 @@ func QuoteCmd(words []string) string {
 	return strings.Join(quoted, " ")
 }
 
+// QuoteWindows makes a string safe as one argument for cmd.exe on a Windows
+// server (experimental): double-quote when needed, escape embedded quotes.
+func QuoteWindows(s string) string {
+	if s != "" && !strings.ContainsAny(s, " \t\"&|<>^%()!';,`") {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+}
+
+// RemoteCmd builds the remote command line using the target OS's quoting.
+func (t Target) RemoteCmd(words []string) string {
+	if t.Server.IsWindows() {
+		quoted := make([]string, len(words))
+		for i, w := range words {
+			quoted[i] = QuoteWindows(w)
+		}
+		return strings.Join(quoted, " ")
+	}
+	return QuoteCmd(words)
+}
+
 // Run executes remoteCmd on the target, streaming combined output to out.
 // stdin is connected when interactive is true (for -f log follows, Ctrl-C).
 func (t Target) Run(remoteCmd string, out io.Writer, interactive bool) error {

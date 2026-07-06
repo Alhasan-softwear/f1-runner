@@ -31,6 +31,9 @@ func (l Layout) CurrentLink(comp string) string { return filepath.Join(l.AppDir(
 func (l Layout) SharedDir(comp string) string   { return filepath.Join(l.AppDir(comp), "shared") }
 func (l Layout) StatePath() string              { return filepath.Join(l.Root, "state.json") }
 
+// EnvFile is the default env file managed by `f1 env set`.
+func (l Layout) EnvFile(comp string) string { return filepath.Join(l.Root, "env", comp+".env") }
+
 // NewReleaseDir creates releases/<utc-stamp>-<shortsha> and the shared dir.
 func (l Layout) NewReleaseDir(comp, sha string, now time.Time) (string, error) {
 	short := sha
@@ -60,25 +63,8 @@ func (l Layout) Current(comp string) string {
 	return filepath.Clean(target)
 }
 
-// Flip atomically points current at releaseDir (symlink swap via rename).
-func (l Layout) Flip(comp, releaseDir string) error {
-	link := l.CurrentLink(comp)
-	tmp := link + ".tmp"
-	os.Remove(tmp)
-	// Relative target keeps the tree relocatable.
-	rel, err := filepath.Rel(filepath.Dir(link), releaseDir)
-	if err != nil {
-		rel = releaseDir
-	}
-	if err := os.Symlink(rel, tmp); err != nil {
-		return fmt.Errorf("symlink: %w", err)
-	}
-	if err := os.Rename(tmp, link); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("activating release: %w", err)
-	}
-	return nil
-}
+// Flip points current at releaseDir; implementation is per-platform
+// (atomic symlink swap on unix, junction on windows).
 
 // Prune deletes old release dirs, keeping the newest `keep` plus whatever
 // current points at.
@@ -117,6 +103,8 @@ type ComponentState struct {
 	Runtime    string `json:"runtime"`
 	Status     string `json:"status"` // ok | failed
 	DeployedAt string `json:"deployedAt"`
+	Slot       string `json:"slot,omitempty"` // blue | green (blue_green deploys)
+	Port       int    `json:"port,omitempty"` // live port of the active slot
 	Previous   *Prev  `json:"previous,omitempty"`
 	Error      string `json:"error,omitempty"`
 }

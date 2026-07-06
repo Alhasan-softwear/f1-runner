@@ -1,5 +1,5 @@
+# dist/ is committed on purpose so users can download binaries straight from the repo.
 /f1
 /f1.exe
-/dist/
 /e2e/.work/
 /e2e/authorized_keys

@@ -42,8 +42,16 @@ func (r *Repo) env() []string {
 	return env
 }
 
+// safeArgs prepends config overrides so f1 works regardless of the host's
+// git hardening: bare-repo access (safe.bareRepository=explicit) and
+// mixed-ownership roots (safe.directory) would otherwise break the managed
+// clone under <root>/repo.
+func safeArgs(args ...string) []string {
+	return append([]string{"-c", "safe.bareRepository=all", "-c", "safe.directory=*"}, args...)
+}
+
 func (r *Repo) git(out io.Writer, args ...string) error {
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", safeArgs(args...)...)
 	cmd.Env = r.env()
 	cmd.Stdout = out
 	cmd.Stderr = out
@@ -51,7 +59,7 @@ func (r *Repo) git(out io.Writer, args ...string) error {
 }
 
 func (r *Repo) gitOutput(args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", safeArgs(args...)...)
 	cmd.Env = r.env()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -106,7 +114,7 @@ func (r *Repo) ChangedIn(oldSha, newSha, path string) bool {
 
 // ShowFile returns a file's content at a commit, e.g. ShowFile(sha, "apps/web/f1.yml").
 func (r *Repo) ShowFile(sha, path string) ([]byte, error) {
-	cmd := exec.Command("git", "-C", r.Dir, "show", sha+":"+path)
+	cmd := exec.Command("git", safeArgs("-C", r.Dir, "show", sha+":"+path)...)
 	cmd.Env = r.env()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -122,7 +130,7 @@ func (r *Repo) ShowFile(sha, path string) ([]byte, error) {
 // The tar stream is read in-process, so the server needs no tar binary and
 // prefix stripping is exact.
 func (r *Repo) ArchiveInto(sha, path, destDir string) error {
-	cmd := exec.Command("git", "-C", r.Dir, "archive", "--format=tar", sha, "--", path)
+	cmd := exec.Command("git", safeArgs("-C", r.Dir, "archive", "--format=tar", sha, "--", path)...)
 	cmd.Env = r.env()
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -134,6 +142,14 @@ func (r *Repo) ArchiveInto(sha, path, destDir string) error {
 		return err
 	}
 	extractErr := extractTar(stdout, path, destDir)
+	if extractErr != nil {
+		// Don't Wait on a writer nobody is reading — it would deadlock.
+		cmd.Process.Kill()
+	} else {
+		// Drain trailing record padding past the tar end marker; otherwise
+		// git blocks writing it (small pipe buffers) and Wait hangs.
+		io.Copy(io.Discard, stdout)
+	}
 	waitErr := cmd.Wait()
 	if extractErr != nil {
 		return fmt.Errorf("extracting %s at %s: %w", path, short(sha), extractErr)

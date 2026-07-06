@@ -29,3 +29,19 @@ func TestQuoteCmd(t *testing.T) {
 		t.Errorf("QuoteCmd = %s, want %s", got, want)
 	}
 }
+
+func TestQuoteWindows(t *testing.T) {
+	cases := map[string]string{
+		"plain":        "plain",
+		"C:/f1/bin/f1": "C:/f1/bin/f1",
+		"a b":          `"a b"`,
+		`say "hi"`:     `"say \"hi\""`,
+		"a&b":          `"a&b"`,
+		"%PATH%":       `"%PATH%"`,
+	}
+	for in, want := range cases {
+		if got := QuoteWindows(in); got != want {
+			t.Errorf("QuoteWindows(%q) = %s, want %s", in, got, want)
+		}
+	}
+}

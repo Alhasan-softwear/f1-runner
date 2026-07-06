@@ -5,12 +5,13 @@ package deploy
 import (
 	"fmt"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Alhasan-softwear/f1-runner/internal/config"
 	"github.com/Alhasan-softwear/f1-runner/internal/gitx"
+	"github.com/Alhasan-softwear/f1-runner/internal/provision"
 	"github.com/Alhasan-softwear/f1-runner/internal/release"
 	"github.com/Alhasan-softwear/f1-runner/internal/runtime"
 	"github.com/Alhasan-softwear/f1-runner/internal/ui"
@@ -26,7 +27,7 @@ type ApplyOptions struct {
 }
 
 // Apply fetches the repo, decides which components need work, and deploys
-// them one at a time. Returns an error if any component failed.
+// them in dependency order. Returns an error if any component failed.
 func Apply(opts ApplyOptions) error {
 	out := ui.NewBarePrefix()
 	defer out.Flush()
@@ -57,11 +58,14 @@ func Apply(opts ApplyOptions) error {
 	if len(targets) == 0 {
 		targets = cfg.ComponentNames()
 	}
-	sort.Strings(targets)
 	for _, name := range targets {
 		if _, ok := cfg.Components[name]; !ok {
 			return fmt.Errorf("unknown component %q (this commit defines: %s)", name, strings.Join(cfg.ComponentNames(), ", "))
 		}
+	}
+	waves, err := cfg.Waves(targets)
+	if err != nil {
+		return err
 	}
 
 	state, err := release.LoadState(layout)
@@ -70,10 +74,19 @@ func Apply(opts ApplyOptions) error {
 	}
 
 	var failed []string
-	for _, name := range targets {
-		if err := deployOne(layout, repo, cfg, state, name, sha, opts, out); err != nil {
-			out.Failf("%s: %v", name, err)
-			failed = append(failed, name)
+	for wi, wave := range waves {
+		if len(waves) > 1 && len(failed) == 0 {
+			out.Notef("wave %d/%d: %s", wi+1, len(waves), strings.Join(wave, ", "))
+		}
+		if len(failed) > 0 {
+			out.Notef("skipping wave %d (%s) — earlier failures", wi+1, strings.Join(wave, ", "))
+			continue
+		}
+		for _, name := range wave {
+			if err := deployOne(layout, repo, cfg, state, name, sha, opts, out); err != nil {
+				out.Failf("%s: %v", name, err)
+				failed = append(failed, name)
+			}
 		}
 	}
 	if len(failed) > 0 {
@@ -111,6 +124,13 @@ func deployOne(layout release.Layout, repo *gitx.Repo, cfg *config.Root, state *
 		return nil
 	}
 
+	if len(m.Provision) > 0 {
+		out.Step("%s: ensuring dependencies (%s)", name, strings.Join(m.Provision, ", "))
+		if err := provision.Ensure(m.Provision, out); err != nil {
+			return err
+		}
+	}
+
 	out.Step("%s: deploying %s (%s runtime)", name, release.ShortSha(sha), m.Runtime)
 	releaseDir, err := layout.NewReleaseDir(name, sha, time.Now())
 	if err != nil {
@@ -127,9 +147,10 @@ func deployOne(layout release.Layout, repo *gitx.Repo, cfg *config.Root, state *
 
 	oldCurrent := layout.Current(name)
 	var deployErr error
+	slot, port := "", 0
 	switch m.Runtime {
 	case "docker":
-		deployErr = deployDocker(layout, name, m, releaseDir, oldCurrent, env, out)
+		slot, port, deployErr = deployDocker(layout, name, m, releaseDir, oldCurrent, prev, env, out)
 	case "script":
 		deployErr = deployScript(layout, name, m, releaseDir, oldCurrent, env, out)
 	}
@@ -140,6 +161,8 @@ func deployOne(layout release.Layout, repo *gitx.Repo, cfg *config.Root, state *
 		Release:    filepath.Base(releaseDir),
 		Runtime:    m.Runtime,
 		DeployedAt: now,
+		Slot:       slot,
+		Port:       port,
 	}
 	if prev.Sha != "" && prev.Status == "ok" {
 		entry.Previous = &release.Prev{Sha: prev.Sha, Release: prev.Release}
@@ -153,6 +176,8 @@ func deployOne(layout release.Layout, repo *gitx.Repo, cfg *config.Root, state *
 		entry.Error = deployErr.Error()
 		entry.Release = prev.Release
 		entry.Sha = prev.Sha
+		entry.Slot = prev.Slot
+		entry.Port = prev.Port
 		if prev.Status != "ok" {
 			entry.Release = ""
 			entry.Sha = ""
@@ -173,7 +198,9 @@ func deployOne(layout release.Layout, repo *gitx.Repo, cfg *config.Root, state *
 	return nil
 }
 
-// stepEnv builds the environment every lifecycle command runs with.
+// stepEnv builds the environment every lifecycle command runs with. The
+// component's env file (explicit env_file, or the default
+// <root>/env/<comp>.env managed by `f1 env set`) is appended.
 func stepEnv(layout release.Layout, name, sha, releaseDir string, m *config.Manifest) ([]string, error) {
 	env := []string{
 		"F1_ROOT=" + layout.Root,
@@ -184,66 +211,116 @@ func stepEnv(layout release.Layout, name, sha, releaseDir string, m *config.Mani
 		"F1_LOG=" + filepath.Join(layout.SharedDir(name), "app.log"),
 		"F1_REF=" + sha,
 	}
-	if m.EnvFile != "" {
-		fileEnv, found, err := runtime.LoadEnvFile(m.EnvFile)
-		if err != nil {
-			return nil, err
-		}
-		if !found {
-			return nil, fmt.Errorf("env_file %s does not exist on this server — create it (or remove env_file from the manifest)", m.EnvFile)
-		}
-		env = append(env, fileEnv...)
+	path, required := m.EnvFile, true
+	if path == "" {
+		path, required = layout.EnvFile(name), false
 	}
-	return env, nil
+	fileEnv, found, err := runtime.LoadEnvFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if !found && required {
+		return nil, fmt.Errorf("env_file %s does not exist on this server — create it with `f1 env set %s KEY=VALUE` (or remove env_file from the manifest)", path, name)
+	}
+	return append(env, fileEnv...), nil
 }
 
-func deployDocker(layout release.Layout, name string, m *config.Manifest, releaseDir, oldCurrent string, env []string, out *ui.PrefixWriter) error {
+// composeProject names the compose project: one per component, or one per
+// slot under blue/green.
+func composeProject(name, slot string) string {
+	if slot == "" {
+		return "f1-" + name
+	}
+	return "f1-" + name + "-" + slot
+}
+
+func deployDocker(layout release.Layout, name string, m *config.Manifest, releaseDir, oldCurrent string, prev release.ComponentState, env []string, out *ui.PrefixWriter) (string, int, error) {
+	slot, port := "", 0
+	if bg := m.BlueGreen; bg != nil {
+		// Alternate slots; first deploy lands on blue.
+		idx := 0
+		if prev.Status == "ok" && prev.Slot == config.SlotNames[0] {
+			idx = 1
+		}
+		slot, port = config.SlotNames[idx], bg.Ports[idx]
+		env = append(env, bg.EnvVar()+"="+strconv.Itoa(port), "F1_SLOT="+slot)
+		if bg.EnvVar() != "F1_PORT" {
+			env = append(env, "F1_PORT="+strconv.Itoa(port))
+		}
+		out.Notef("%s: blue/green — deploying to %s slot on port %d", name, slot, port)
+	}
+	project := composeProject(name, slot)
+
 	if m.Scripts.Setup != "" {
 		out.Step("%s: setup", name)
-		if err := runtime.Exec(releaseDir, m.Scripts.Setup, env, out); err != nil {
-			return err
+		if err := runtime.Exec(releaseDir, m.Scripts.Setup, m.Shell, env, out); err != nil {
+			return slot, port, err
 		}
 	}
 	out.Step("%s: docker compose build", name)
-	if err := runtime.Compose(name, releaseDir, m.Docker.Compose, env, out, "build"); err != nil {
-		return err
+	if err := runtime.Compose(project, releaseDir, m.Docker.Compose, env, out, "build"); err != nil {
+		return slot, port, err
 	}
 	out.Step("%s: docker compose up -d", name)
-	if err := runtime.Compose(name, releaseDir, m.Docker.Compose, env, out, "up", "-d", "--remove-orphans"); err != nil {
-		return err
+	if err := runtime.Compose(project, releaseDir, m.Docker.Compose, env, out, "up", "-d", "--remove-orphans"); err != nil {
+		return slot, port, err
 	}
 	if m.Health.Defined() {
 		out.Step("%s: health check", name)
-		if err := runtime.HealthCheck(m.Health, releaseDir, env, out); err != nil {
-			if oldCurrent != "" {
+		if err := runtime.HealthCheck(m.Health, releaseDir, m.Shell, port, env, out); err != nil {
+			if m.BlueGreen != nil {
+				// The old slot never stopped serving; just tear the new one down.
+				out.Notef("%s: tearing down unhealthy %s slot (old slot still live)", name, slot)
+				runtime.Compose(project, releaseDir, m.Docker.Compose, env, out, "down", "--remove-orphans")
+			} else if oldCurrent != "" {
 				out.Notef("%s: restoring previous release", name)
-				if rerr := runtime.Compose(name, oldCurrent, m.Docker.Compose, env, out, "up", "-d", "--remove-orphans"); rerr != nil {
+				if rerr := runtime.Compose(project, oldCurrent, m.Docker.Compose, env, out, "up", "-d", "--remove-orphans"); rerr != nil {
 					out.Failf("%s: restore also failed: %v", name, rerr)
 				}
 			}
-			return err
+			return slot, port, err
 		}
 	}
-	return layout.Flip(name, releaseDir)
+	if bg := m.BlueGreen; bg != nil {
+		if bg.Switch != "" {
+			out.Step("%s: switch traffic -> %s (:%d)", name, slot, port)
+			switchEnv := env
+			if prev.Port > 0 {
+				switchEnv = append(switchEnv, "F1_OLD_PORT="+strconv.Itoa(prev.Port))
+			}
+			if err := runtime.Exec(releaseDir, bg.Switch, m.Shell, switchEnv, out); err != nil {
+				out.Notef("%s: tearing down %s slot after failed switch", name, slot)
+				runtime.Compose(project, releaseDir, m.Docker.Compose, env, out, "down", "--remove-orphans")
+				return slot, port, err
+			}
+		}
+		if prev.Slot != "" && prev.Slot != slot && oldCurrent != "" {
+			out.Step("%s: stopping old %s slot", name, prev.Slot)
+			if err := runtime.Compose(composeProject(name, prev.Slot), oldCurrent, m.Docker.Compose, env, out, "down", "--remove-orphans"); err != nil {
+				out.Notef("%s: could not stop old slot (continuing): %v", name, err)
+			}
+		}
+	}
+	return slot, port, layout.Flip(name, releaseDir)
 }
 
 func deployScript(layout release.Layout, name string, m *config.Manifest, releaseDir, oldCurrent string, env []string, out *ui.PrefixWriter) error {
 	if m.Scripts.Setup != "" {
 		out.Step("%s: setup", name)
-		if err := runtime.Exec(releaseDir, m.Scripts.Setup, env, out); err != nil {
+		if err := runtime.Exec(releaseDir, m.Scripts.Setup, m.Shell, env, out); err != nil {
 			return err
 		}
 	}
 	if m.Scripts.Build != "" {
 		out.Step("%s: build", name)
-		if err := runtime.Exec(releaseDir, m.Scripts.Build, env, out); err != nil {
+		if err := runtime.Exec(releaseDir, m.Scripts.Build, m.Shell, env, out); err != nil {
 			return err
 		}
 	}
 	if oldCurrent != "" && m.Scripts.Stop != "" {
 		out.Step("%s: stop old release", name)
 		oldEnv := replaceEnv(env, "F1_RELEASE", oldCurrent)
-		if err := runtime.Exec(oldCurrent, m.Scripts.Stop, oldEnv, out); err != nil {
+		if err := runtime.Exec(oldCurrent, m.Scripts.Stop, m.Shell, oldEnv, out); err != nil {
 			out.Notef("%s: stop reported an error (continuing): %v", name, err)
 		}
 	}
@@ -251,17 +328,17 @@ func deployScript(layout release.Layout, name string, m *config.Manifest, releas
 		return err
 	}
 	out.Step("%s: start", name)
-	startErr := runtime.Exec(layout.CurrentLink(name), m.Scripts.Start, env, out)
+	startErr := runtime.Exec(layout.CurrentLink(name), m.Scripts.Start, m.Shell, env, out)
 	if startErr == nil && m.Health.Defined() {
 		out.Step("%s: health check", name)
-		startErr = runtime.HealthCheck(m.Health, layout.CurrentLink(name), env, out)
+		startErr = runtime.HealthCheck(m.Health, layout.CurrentLink(name), m.Shell, 0, env, out)
 	}
 	if startErr != nil {
 		if oldCurrent != "" {
 			out.Notef("%s: rolling back to previous release", name)
 			if err := layout.Flip(name, oldCurrent); err == nil {
 				oldEnv := replaceEnv(env, "F1_RELEASE", oldCurrent)
-				if rerr := runtime.Exec(layout.CurrentLink(name), m.Scripts.Start, oldEnv, out); rerr != nil {
+				if rerr := runtime.Exec(layout.CurrentLink(name), m.Scripts.Start, m.Shell, oldEnv, out); rerr != nil {
 					out.Failf("%s: restart of previous release also failed: %v", name, rerr)
 				}
 			}

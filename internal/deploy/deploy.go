@@ -25,11 +25,9 @@ type DeployOptions struct {
 	DryRun     bool
 }
 
-// remoteF1 is the binary path used on servers, inside the f1 root.
-func remoteF1(s config.Server) string { return s.Root + "/bin/f1" }
-
-// Deploy groups the requested components by server and runs `f1 apply` on
-// each server in parallel, streaming prefixed output.
+// Deploy resolves dependency waves, then runs `f1 apply` on every target
+// server in parallel within each wave, with a barrier between waves so
+// dependencies are live (and health-checked) before their dependents start.
 func Deploy(cfg *config.Root, opts DeployOptions) error {
 	if err := sshx.CheckBinaries(); err != nil {
 		return err
@@ -43,29 +41,44 @@ func Deploy(cfg *config.Root, opts DeployOptions) error {
 			return fmt.Errorf("unknown component %q (defined: %s)", name, strings.Join(cfg.ComponentNames(), ", "))
 		}
 	}
+	waves, err := cfg.Waves(targets)
+	if err != nil {
+		return err
+	}
 
 	ref := opts.Ref
 	if ref == "" {
 		ref = cfg.Branch
 	}
-	// Pin the ref to a sha once, so every server deploys the same commit even
-	// if someone pushes mid-deploy. Falls back to the ref name when the repo
-	// isn't reachable from this machine (e.g. a server-local path).
+	// Pin the ref to a sha once, so every server (and every wave) deploys the
+	// same commit even if someone pushes mid-deploy. Falls back to the ref
+	// name when the repo isn't reachable from this machine.
 	pinned := pinRef(cfg.Repo, ref)
 	if pinned != ref {
 		ui.Printf("%s %s -> %s", ui.Dim("ref"), ref, release.ShortSha(pinned))
 	}
 
-	byServer := map[string][]string{}
-	for _, name := range targets {
-		for _, sv := range cfg.Components[name].Servers {
-			byServer[sv] = append(byServer[sv], name)
+	for wi, wave := range waves {
+		if len(waves) > 1 {
+			ui.Printf("%s", ui.Bold(fmt.Sprintf("wave %d/%d: %s", wi+1, len(waves), strings.Join(wave, ", "))))
+		}
+		byServer := map[string][]string{}
+		for _, name := range wave {
+			for _, sv := range cfg.Components[name].Servers {
+				byServer[sv] = append(byServer[sv], name)
+			}
+		}
+		if err := deployWave(cfg, byServer, pinned, opts); err != nil {
+			if wi < len(waves)-1 {
+				return fmt.Errorf("%w — later waves were not deployed", err)
+			}
+			return err
 		}
 	}
-	if len(byServer) == 0 {
-		return fmt.Errorf("nothing to deploy")
-	}
+	return nil
+}
 
+func deployWave(cfg *config.Root, byServer map[string][]string, ref string, opts DeployOptions) error {
 	var wg sync.WaitGroup
 	errs := make(map[string]error)
 	var mu sync.Mutex
@@ -73,10 +86,10 @@ func Deploy(cfg *config.Root, opts DeployOptions) error {
 		comps := byServer[sv]
 		target := sshx.Target{Name: sv, Server: cfg.Servers[sv]}
 		out := ui.NewPrefix(sv)
-		words := []string{remoteF1(target.Server), "apply",
+		words := []string{target.Server.F1Bin(), "apply",
 			"--root", target.Server.Root,
 			"--repo", cfg.Repo,
-			"--ref", pinned,
+			"--ref", ref,
 			"--components", strings.Join(comps, ","),
 		}
 		if opts.Force {
@@ -90,7 +103,7 @@ func Deploy(cfg *config.Root, opts DeployOptions) error {
 			defer wg.Done()
 			defer out.Flush()
 			out.Step("deploying %s", strings.Join(comps, ", "))
-			err := target.Run(sshx.QuoteCmd(words), out, false)
+			err := target.Run(target.RemoteCmd(words), out, false)
 			if err != nil {
 				out.Failf("deploy failed: %v", err)
 			} else {
@@ -176,7 +189,7 @@ func Status(cfg *config.Root, serverFilter string) error {
 		wg.Add(1)
 		go func(sv string, target sshx.Target) {
 			defer wg.Done()
-			cmd := sshx.QuoteCmd([]string{remoteF1(target.Server), "status", "--local", "--json", "--root", target.Server.Root})
+			cmd := target.RemoteCmd([]string{target.Server.F1Bin(), "status", "--local", "--json", "--root", target.Server.Root})
 			outStr, err := target.Output(cmd, ui.NewPrefix(sv))
 			mu.Lock()
 			defer mu.Unlock()
@@ -199,7 +212,7 @@ func Status(cfg *config.Root, serverFilter string) error {
 	if len(rows) == 0 {
 		ui.Printf("nothing deployed yet")
 	} else {
-		ui.Printf("%-14s %-16s %-8s %-28s %-9s %s", "SERVER", "COMPONENT", "STATUS", "RELEASE", "SHA", "DEPLOYED")
+		ui.Printf("%-14s %-16s %-8s %-28s %-9s %-11s %s", "SERVER", "COMPONENT", "STATUS", "RELEASE", "SHA", "SLOT", "DEPLOYED")
 		for _, r := range sortedRows(rows, func(r row) string { return r.server + "/" + r.comp }) {
 			status := r.cs.Status
 			if status == "failed" {
@@ -207,7 +220,7 @@ func Status(cfg *config.Root, serverFilter string) error {
 			} else {
 				status = ui.Green(status)
 			}
-			ui.Printf("%-14s %-16s %-8s %-28s %-9s %s", r.server, r.comp, status, orDash(r.cs.Release), release.ShortSha(r.cs.Sha), release.Ago(r.cs.DeployedAt))
+			ui.Printf("%-14s %-16s %-8s %-28s %-9s %-11s %s", r.server, r.comp, status, orDash(r.cs.Release), release.ShortSha(r.cs.Sha), slotLabel(r.cs), release.Ago(r.cs.DeployedAt))
 		}
 	}
 	if len(unreachable) > 0 {
@@ -231,11 +244,11 @@ func Logs(cfg *config.Root, comp, serverFilter string, lines int, follow bool) e
 	for _, sv := range servers {
 		target := sshx.Target{Name: sv, Server: cfg.Servers[sv]}
 		out := ui.NewPrefix(sv)
-		words := []string{remoteF1(target.Server), "logs", comp, "--local", "--root", target.Server.Root, "-n", strconv.Itoa(lines)}
+		words := []string{target.Server.F1Bin(), "logs", comp, "--local", "--root", target.Server.Root, "-n", strconv.Itoa(lines)}
 		if follow {
 			words = append(words, "-f")
 		}
-		if err := target.Run(sshx.QuoteCmd(words), out, follow); err != nil {
+		if err := target.Run(target.RemoteCmd(words), out, follow); err != nil {
 			out.Flush()
 			return err
 		}
@@ -257,8 +270,8 @@ func Rollback(cfg *config.Root, comp, serverFilter string) error {
 	for _, sv := range servers {
 		target := sshx.Target{Name: sv, Server: cfg.Servers[sv]}
 		out := ui.NewPrefix(sv)
-		words := []string{remoteF1(target.Server), "rollback", comp, "--local", "--root", target.Server.Root}
-		if err := target.Run(sshx.QuoteCmd(words), out, false); err != nil {
+		words := []string{target.Server.F1Bin(), "rollback", comp, "--local", "--root", target.Server.Root}
+		if err := target.Run(target.RemoteCmd(words), out, false); err != nil {
 			out.Failf("rollback failed: %v", err)
 			failed = append(failed, sv)
 		}

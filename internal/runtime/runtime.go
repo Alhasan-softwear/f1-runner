@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	gorun "runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,11 +20,32 @@ import (
 // StepTimeout bounds any single lifecycle command (setup/build/start/...).
 const StepTimeout = 20 * time.Minute
 
+// shellArgv maps a manifest shell to an interpreter invocation. Empty picks
+// the platform default (sh on unix, cmd on windows).
+func shellArgv(shell string) []string {
+	switch shell {
+	case "bash":
+		return []string{"bash", "-c"}
+	case "cmd":
+		return []string{"cmd", "/c"}
+	case "powershell":
+		return []string{"powershell", "-NoProfile", "-Command"}
+	case "sh":
+		return []string{"sh", "-c"}
+	default:
+		if gorun.GOOS == "windows" {
+			return []string{"cmd", "/c"}
+		}
+		return []string{"sh", "-c"}
+	}
+}
+
 // Exec runs a shell command in dir with extraEnv appended, streaming output.
-func Exec(dir, command string, extraEnv []string, out io.Writer) error {
+func Exec(dir, command, shell string, extraEnv []string, out io.Writer) error {
+	argv := shellArgv(shell)
 	ctx, cancel := context.WithTimeout(context.Background(), StepTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	cmd := exec.CommandContext(ctx, argv[0], append(argv[1:], command)...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), extraEnv...)
 	cmd.Stdout = out
@@ -82,15 +105,16 @@ func ComposeCommand() ([]string, error) {
 	return nil, fmt.Errorf("neither `docker compose` nor `docker-compose` is available")
 }
 
-// Compose runs a compose subcommand for a component's project from dir.
-// Project name is pinned to f1-<comp> so a compose up from a new release dir
-// replaces the containers started from the previous one.
-func Compose(comp, dir, composeFile string, extraEnv []string, out io.Writer, args ...string) error {
+// Compose runs a compose subcommand for the given project from dir. Pinning
+// the project name means an `up` from a new release dir replaces the
+// containers started from the previous one (and blue/green slots get their
+// own projects).
+func Compose(project, dir, composeFile string, extraEnv []string, out io.Writer, args ...string) error {
 	base, err := ComposeCommand()
 	if err != nil {
 		return err
 	}
-	full := append(append([]string{}, base[1:]...), "-p", "f1-"+comp, "-f", composeFile)
+	full := append(append([]string{}, base[1:]...), "-p", project, "-f", composeFile)
 	full = append(full, args...)
 	ctx, cancel := context.WithTimeout(context.Background(), StepTimeout)
 	defer cancel()
@@ -109,9 +133,20 @@ func Compose(comp, dir, composeFile string, extraEnv []string, out io.Writer, ar
 	return nil
 }
 
-// HealthCheck runs the manifest's health probe with retries. Returns nil when
-// the component reports healthy.
-func HealthCheck(h config.Health, dir string, extraEnv []string, out io.Writer) error {
+// SubstPort replaces $F1_PORT / ${F1_PORT} in a string (used for health URLs
+// under blue/green, where the live port alternates).
+func SubstPort(s string, port int) string {
+	if port <= 0 {
+		return s
+	}
+	p := strconv.Itoa(port)
+	s = strings.ReplaceAll(s, "${F1_PORT}", p)
+	return strings.ReplaceAll(s, "$F1_PORT", p)
+}
+
+// HealthCheck runs the manifest's health probe with retries. port > 0
+// substitutes $F1_PORT in a health URL. Returns nil when healthy.
+func HealthCheck(h config.Health, dir, shell string, port int, extraEnv []string, out io.Writer) error {
 	retries := h.RetriesOrDefault()
 	interval := h.IntervalOrDefault()
 	var lastErr error
@@ -119,7 +154,7 @@ func HealthCheck(h config.Health, dir string, extraEnv []string, out io.Writer) 
 		if attempt > 1 {
 			time.Sleep(interval)
 		}
-		lastErr = probe(h, dir, extraEnv, out)
+		lastErr = probe(h, dir, shell, port, extraEnv)
 		if lastErr == nil {
 			return nil
 		}
@@ -128,23 +163,24 @@ func HealthCheck(h config.Health, dir string, extraEnv []string, out io.Writer) 
 	return fmt.Errorf("unhealthy after %d attempts: %w", retries, lastErr)
 }
 
-func probe(h config.Health, dir string, extraEnv []string, out io.Writer) error {
+func probe(h config.Health, dir, shell string, port int, extraEnv []string) error {
 	if h.URL != "" {
+		url := SubstPort(h.URL, port)
 		client := &http.Client{Timeout: 10 * time.Second}
-		resp, err := client.Get(h.URL)
+		resp, err := client.Get(url)
 		if err != nil {
 			return err
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= 400 {
-			return fmt.Errorf("GET %s -> %s", h.URL, resp.Status)
+			return fmt.Errorf("GET %s -> %s", url, resp.Status)
 		}
 		return nil
 	}
-	// h.Cmd — run quietly; only health output on failure would be noise.
+	argv := shellArgv(shell)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", h.Cmd)
+	cmd := exec.CommandContext(ctx, argv[0], append(argv[1:], h.Cmd)...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), extraEnv...)
 	cmd.Stdout = io.Discard

@@ -47,7 +47,7 @@ servers:
     ssh_opts: ["-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=/dev/null","-o","LogLevel=ERROR"]
 components:
   web:    { path: apps/web,    servers: [prod] }
-  worker: { path: apps/worker, servers: [prod] }
+  worker: { path: apps/worker, servers: [prod], depends_on: [web] }
 EOF
 $SSH git init --bare -b main /srv/repo.git >/dev/null
 cd "$WORK/mono"

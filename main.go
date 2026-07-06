@@ -1,7 +1,8 @@
 // f1 — push a monorepo, run every component where it belongs.
 //
-// One binary, two roles: on your machine it plans and fans out over SSH; on
-// each server it fetches the repo and runs component lifecycles.
+// One binary, three roles: on your machine it plans and fans out over SSH; on
+// each server it fetches the repo and runs component lifecycles; and it can
+// stay resident as a webhook agent for CI-triggered deploys.
 package main
 
 import (
@@ -11,33 +12,40 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Alhasan-softwear/f1-runner/internal/agent"
 	"github.com/Alhasan-softwear/f1-runner/internal/config"
 	"github.com/Alhasan-softwear/f1-runner/internal/deploy"
+	"github.com/Alhasan-softwear/f1-runner/internal/provision"
 	"github.com/Alhasan-softwear/f1-runner/internal/ui"
 )
 
-var version = "0.1.0"
+var version = "0.2.0"
 
 const usage = `f1 %s — deploy a monorepo to one or many servers
 
 Usage on your machine (needs f1.yml in the current directory):
   f1 init                      scaffold a root f1.yml
   f1 init component <path>     scaffold a component f1.yml at <path>
-  f1 server setup [names…]     prepare server(s): layout, binary, deploy key
+  f1 server setup [names…]     prepare server(s): layout, binary, deploy key, provisioning
   f1 deploy <comps…|--all>     deploy components  [--ref R] [--force] [--dry-run]
   f1 status [--server S]       what is deployed where
   f1 logs <comp> [-n N] [-f]   tail a component's logs  [--server S]
   f1 rollback <comp>           instant rollback to the previous release  [--server S]
+  f1 env set <comp> K=V …      set server-side secrets   [--server S]
+  f1 env unset <comp> K …      remove keys               [--server S]
+  f1 env show <comp>           print the env file        [--server S]
   f1 version
 
 On servers (run automatically over SSH; also usable manually or from cron):
   f1 apply --root /opt/f1 --repo URL --ref R [--components a,b] [--force] [--dry-run]
-  f1 status|logs|rollback --local --root /opt/f1
+  f1 agent --root /opt/f1 --repo URL --token SECRET [--listen :9123] [--branch main]
+  f1 provision --local pkg[,pkg…]      install runtimes (%s)
+  f1 status|logs|rollback|env --local --root /opt/f1
 `
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Printf(usage, version)
+		printUsage()
 		os.Exit(2)
 	}
 	var err error
@@ -56,12 +64,18 @@ func main() {
 		err = cmdRollback(os.Args[2:])
 	case "server":
 		err = cmdServer(os.Args[2:])
+	case "env":
+		err = cmdEnv(os.Args[2:])
+	case "agent":
+		err = cmdAgent(os.Args[2:])
+	case "provision":
+		err = cmdProvision(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println(version)
 	case "help", "--help", "-h":
-		fmt.Printf(usage, version)
+		printUsage()
 	default:
-		fmt.Printf(usage, version)
+		printUsage()
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
 	if err != nil {
@@ -70,12 +84,28 @@ func main() {
 	}
 }
 
+func printUsage() {
+	fmt.Printf(usage, version, strings.Join(provision.Known(), ", "))
+}
+
 func loadRoot(path string) (*config.Root, error) {
 	cfg, err := config.LoadRoot(path)
 	if os.IsNotExist(err) {
 		return nil, fmt.Errorf("no %s here — run this from your monorepo root (or scaffold one with `f1 init`)", path)
 	}
 	return cfg, err
+}
+
+// splitLeadingArgs peels positional words off the front so both
+// `f1 logs web -f` and `f1 logs -f web` work with stdlib flag.
+func splitLeadingArgs(args []string) ([]string, []string) {
+	var positional []string
+	rest := args
+	for len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		positional = append(positional, rest[0])
+		rest = rest[1:]
+	}
+	return positional, rest
 }
 
 func cmdDeploy(args []string) error {
@@ -146,13 +176,7 @@ func cmdLogs(args []string) error {
 	lines := fs.Int("n", 100, "number of lines")
 	follow := fs.Bool("f", false, "follow")
 	cfgPath := fs.String("config", "f1.yml", "path to the root config")
-	// Accept both `f1 logs web -f` and `f1 logs -f web`.
-	var comps []string
-	rest := args
-	for len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
-		comps = append(comps, rest[0])
-		rest = rest[1:]
-	}
+	comps, rest := splitLeadingArgs(args)
 	fs.Parse(rest)
 	comps = append(comps, fs.Args()...)
 	if len(comps) != 1 {
@@ -174,12 +198,7 @@ func cmdRollback(args []string) error {
 	root := fs.String("root", "/opt/f1", "f1 root (with --local)")
 	server := fs.String("server", "", "only this server")
 	cfgPath := fs.String("config", "f1.yml", "path to the root config")
-	var comps []string
-	rest := args
-	for len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
-		comps = append(comps, rest[0])
-		rest = rest[1:]
-	}
+	comps, rest := splitLeadingArgs(args)
 	fs.Parse(rest)
 	comps = append(comps, fs.Args()...)
 	if len(comps) != 1 {
@@ -200,14 +219,9 @@ func cmdServer(args []string) error {
 		return fmt.Errorf("usage: f1 server setup [names…] [--binary path]")
 	}
 	fs := flag.NewFlagSet("server setup", flag.ExitOnError)
-	binary := fs.String("binary", "", "local path to a linux f1 binary to upload")
+	binary := fs.String("binary", "", "local path to a server f1 binary to upload")
 	cfgPath := fs.String("config", "f1.yml", "path to the root config")
-	var names []string
-	rest := args[1:]
-	for len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
-		names = append(names, rest[0])
-		rest = rest[1:]
-	}
+	names, rest := splitLeadingArgs(args[1:])
 	fs.Parse(rest)
 	names = append(names, fs.Args()...)
 	cfg, err := loadRoot(*cfgPath)
@@ -215,6 +229,83 @@ func cmdServer(args []string) error {
 		return err
 	}
 	return deploy.ServerSetup(cfg, deploy.SetupOptions{Servers: names, Binary: *binary})
+}
+
+func cmdEnv(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: f1 env set|unset|show <component> [KEY=VALUE|KEY …] [--server S]")
+	}
+	op := args[0]
+	if op != "set" && op != "unset" && op != "show" {
+		return fmt.Errorf("unknown env operation %q (set, unset, or show)", op)
+	}
+	fs := flag.NewFlagSet("env "+op, flag.ExitOnError)
+	local := fs.Bool("local", false, "operate on this machine's env files")
+	root := fs.String("root", "/opt/f1", "f1 root (with --local)")
+	server := fs.String("server", "", "only this server")
+	cfgPath := fs.String("config", "f1.yml", "path to the root config")
+	positional, rest := splitLeadingArgs(args[1:])
+	fs.Parse(rest)
+	positional = append(positional, fs.Args()...)
+	if len(positional) < 1 {
+		return fmt.Errorf("usage: f1 env %s <component> …", op)
+	}
+	comp, kvArgs := positional[0], positional[1:]
+	switch {
+	case op == "set" && len(kvArgs) == 0:
+		return fmt.Errorf("usage: f1 env set <component> KEY=VALUE [KEY=VALUE…]")
+	case op == "unset" && len(kvArgs) == 0:
+		return fmt.Errorf("usage: f1 env unset <component> KEY [KEY…]")
+	case op == "show" && len(kvArgs) > 0:
+		return fmt.Errorf("usage: f1 env show <component>")
+	}
+	if *local {
+		switch op {
+		case "set":
+			return deploy.EnvSetLocal(*root, comp, kvArgs)
+		case "unset":
+			return deploy.EnvUnsetLocal(*root, comp, kvArgs)
+		default:
+			return deploy.EnvShowLocal(*root, comp)
+		}
+	}
+	cfg, err := loadRoot(*cfgPath)
+	if err != nil {
+		return err
+	}
+	return deploy.Env(cfg, op, comp, *server, kvArgs)
+}
+
+func cmdAgent(args []string) error {
+	fs := flag.NewFlagSet("agent", flag.ExitOnError)
+	root := fs.String("root", "/opt/f1", "f1 root directory on this machine")
+	repo := fs.String("repo", "", "git URL or local path of the monorepo")
+	listen := fs.String("listen", ":9123", "listen address")
+	token := fs.String("token", os.Getenv("F1_AGENT_TOKEN"), "auth token (or F1_AGENT_TOKEN)")
+	branch := fs.String("branch", "main", "branch whose pushes trigger deploys")
+	compsCSV := fs.String("components", "", "restrict which components this agent deploys")
+	fs.Parse(args)
+	var comps []string
+	if *compsCSV != "" {
+		comps = strings.Split(*compsCSV, ",")
+	}
+	return agent.Run(agent.Options{
+		Root: *root, RepoURL: *repo, Branch: *branch, Listen: *listen, Token: *token, Components: comps,
+	})
+}
+
+func cmdProvision(args []string) error {
+	fs := flag.NewFlagSet("provision", flag.ExitOnError)
+	local := fs.Bool("local", false, "install on this machine (servers get this via `f1 server setup`)")
+	fs.Parse(args)
+	pkgs := strings.Join(fs.Args(), ",")
+	if !*local {
+		return fmt.Errorf("f1 provision runs on servers: use --local there, or list packages under provision: in f1.yml and run `f1 server setup`")
+	}
+	if pkgs == "" {
+		return fmt.Errorf("usage: f1 provision --local pkg[,pkg…]  (known: %s)", strings.Join(provision.Known(), ", "))
+	}
+	return provision.Ensure(strings.Split(pkgs, ","), os.Stdout)
 }
 
 const rootTemplate = `# f1 root config — commit this at your monorepo root.
@@ -226,15 +317,18 @@ servers:
   web1:
     host: 1.2.3.4
     user: deploy
+    provision: [git, docker]        # installed by ` + "`f1 server setup`" + `
     # port: 22
     # key: ~/.ssh/id_ed25519        # identity file for YOUR ssh to the server
     # root: /opt/f1                 # where f1 lives on the server
+    # os: windows                   # experimental windows servers
     # ssh_opts: ["-o", "StrictHostKeyChecking=accept-new"]
 
 components:
   web:
     path: apps/web                  # subdirectory with its own f1.yml
     servers: [web1]                 # one component can target many servers
+    # depends_on: [api]             # deployed in dependency order (waves)
 `
 
 const componentTemplate = `# f1 component manifest — lives inside the component directory.
@@ -244,8 +338,16 @@ runtime: docker                     # docker | script
 docker:
   compose: docker-compose.yml       # relative to this directory
 
+# provision: [python, node@22, php, apache, mariadb, postgres, redis, nginx]
+#                                   # runtimes f1 installs on the server first
+
+# blue_green:                       # zero-downtime slot deploys (docker only)
+#   ports: [8001, 8002]             # compose must publish "${F1_PORT}:80"
+#   switch: ./scripts/switch.sh     # move traffic (e.g. rewrite nginx upstream)
+
 # runtime: script components use lifecycle commands instead (run from the
 # release directory, with $F1_RELEASE $F1_SHARED $F1_LOG $F1_REF set):
+# shell: sh                         # sh | bash | cmd | powershell
 # scripts:
 #   setup: ./scripts/setup.sh
 #   build: ./scripts/build.sh
@@ -253,7 +355,8 @@ docker:
 #   stop:  ./scripts/stop.sh
 #   logs:  tail -n 100 $F1_LOG
 
-# env_file: /opt/f1/env/%s.env      # server-side secrets, never in the repo
+# env_file: /opt/f1/env/%s.env      # explicit secrets file; default is the
+#                                   # one managed by ` + "`f1 env set %s KEY=VALUE`" + `
 
 health:
   url: http://localhost:8080/       # or cmd: "curl -fsS http://localhost:8080/"
@@ -277,7 +380,7 @@ func cmdInit(args []string) error {
 			return fmt.Errorf("%s already exists", dest)
 		}
 		name := strings.ToLower(filepath.Base(filepath.Clean(dir)))
-		content := fmt.Sprintf(componentTemplate, name, name)
+		content := fmt.Sprintf(componentTemplate, name, name, name)
 		if err := os.WriteFile(dest, []byte(content), 0o644); err != nil {
 			return err
 		}
