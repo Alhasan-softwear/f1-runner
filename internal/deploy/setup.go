@@ -168,7 +168,7 @@ func provisionFromManifests(cfg *config.Root, server string) []string {
 		if !hosted {
 			continue
 		}
-		raw, err := os.ReadFile(filepath.Join(filepath.FromSlash(comp.Path), "f1.yml"))
+		raw, err := os.ReadFile(filepath.FromSlash(comp.ManifestPath()))
 		if err != nil {
 			continue // not fatal: manifest read happens authoritatively at apply time
 		}

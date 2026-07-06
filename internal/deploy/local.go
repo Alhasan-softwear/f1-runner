@@ -90,7 +90,7 @@ func manifestForSha(layout release.Layout, comp, sha string) (*config.Manifest, 
 	if !ok {
 		return nil, fmt.Errorf("component %q is missing from f1.yml at commit %s", comp, release.ShortSha(sha))
 	}
-	raw, err := repo.ShowFile(sha, def.Path+"/f1.yml")
+	raw, err := repo.ShowFile(sha, def.ManifestPath())
 	if err != nil {
 		return nil, err
 	}

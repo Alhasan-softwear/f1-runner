@@ -130,7 +130,11 @@ func (r *Repo) ShowFile(sha, path string) ([]byte, error) {
 // The tar stream is read in-process, so the server needs no tar binary and
 // prefix stripping is exact.
 func (r *Repo) ArchiveInto(sha, path, destDir string) error {
-	cmd := exec.Command("git", safeArgs("-C", r.Dir, "archive", "--format=tar", sha, "--", path)...)
+	args := []string{"-C", r.Dir, "archive", "--format=tar", sha}
+	if path != "." && path != "" {
+		args = append(args, "--", path)
+	}
+	cmd := exec.Command("git", safeArgs(args...)...)
 	cmd.Env = r.env()
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -162,6 +166,9 @@ func (r *Repo) ArchiveInto(sha, path, destDir string) error {
 
 func extractTar(src io.Reader, stripPrefix, destDir string) error {
 	prefix := strings.TrimSuffix(stripPrefix, "/") + "/"
+	if stripPrefix == "." || stripPrefix == "" {
+		prefix = "" // root component: entries arrive unprefixed
+	}
 	tr := tar.NewReader(src)
 	seen := false
 	for {
@@ -173,11 +180,11 @@ func extractTar(src io.Reader, stripPrefix, destDir string) error {
 			return err
 		}
 		name := hdr.Name
-		if name == stripPrefix || name == prefix { // the component dir entry itself
+		if prefix != "" && (name == stripPrefix || name == prefix) { // the component dir entry itself
 			seen = true
 			continue
 		}
-		if !strings.HasPrefix(name, prefix) {
+		if prefix != "" && !strings.HasPrefix(name, prefix) {
 			continue // pax headers etc.
 		}
 		seen = true

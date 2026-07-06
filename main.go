@@ -20,7 +20,7 @@ import (
 	"github.com/Alhasan-softwear/f1-runner/internal/webui"
 )
 
-var version = "0.3.0"
+var version = "0.3.1"
 
 const usage = `f1 %s — deploy a monorepo to one or many servers
 

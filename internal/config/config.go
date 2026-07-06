@@ -46,10 +46,25 @@ func (s Server) F1Bin() string {
 }
 
 // Component maps a monorepo subdirectory onto one or more servers.
+// Path may be "." to deploy the whole repo as one component — in that case
+// Manifest must name a file other than f1.yml (which is the root config).
 type Component struct {
 	Path      string   `yaml:"path"`
+	Manifest  string   `yaml:"manifest"` // manifest filename inside Path, default f1.yml
 	Servers   []string `yaml:"servers"`
 	DependsOn []string `yaml:"depends_on"` // deployed (and health-checked) before this one
+}
+
+// ManifestPath is the repo-relative path of this component's manifest.
+func (c Component) ManifestPath() string {
+	name := c.Manifest
+	if name == "" {
+		name = "f1.yml"
+	}
+	if c.Path == "." {
+		return name
+	}
+	return c.Path + "/" + name
 }
 
 // Manifest is a component's own f1.yml, read from the repo at the deployed
@@ -201,11 +216,17 @@ func (r *Root) Validate() error {
 			return fmt.Errorf("f1.yml: component name %q is invalid (use lowercase letters, digits, - or _)", name)
 		}
 		p := strings.TrimSuffix(strings.ReplaceAll(c.Path, "\\", "/"), "/")
-		if p == "" || p == "." {
-			return fmt.Errorf("f1.yml: component %q needs a 'path' that is a subdirectory of the repo (not the repo root)", name)
+		if p == "" {
+			return fmt.Errorf("f1.yml: component %q needs a 'path' (a subdirectory, or \".\" for the repo root)", name)
 		}
-		if strings.HasPrefix(p, "/") || strings.Contains(p, "..") {
+		if p == "." && (c.Manifest == "" || c.Manifest == "f1.yml") {
+			return fmt.Errorf("f1.yml: root component %q must set 'manifest:' to a filename other than f1.yml (e.g. manifest: f1.%s.yml)", name, name)
+		}
+		if p != "." && (strings.HasPrefix(p, "/") || strings.Contains(p, "..")) {
 			return fmt.Errorf("f1.yml: component %q path %q must be relative and inside the repo", name, c.Path)
+		}
+		if m := c.Manifest; m != "" && (strings.ContainsAny(m, "/\\") || strings.Contains(m, "..")) {
+			return fmt.Errorf("f1.yml: component %q manifest %q must be a plain filename inside its path", name, m)
 		}
 		if len(c.Servers) == 0 {
 			return fmt.Errorf("f1.yml: component %q needs at least one entry in 'servers'", name)

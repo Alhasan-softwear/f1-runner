@@ -215,7 +215,7 @@ func (s *server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		c := cfg.Components[name]
 		oc := overviewComponent{Name: name, Path: c.Path, Servers: c.Servers, DependsOn: c.DependsOn}
 		// Manifest details come from the local working tree; best-effort.
-		if raw, err := os.ReadFile(filepath.Join(s.configDir, filepath.FromSlash(c.Path), "f1.yml")); err == nil {
+		if raw, err := os.ReadFile(filepath.Join(s.configDir, filepath.FromSlash(c.ManifestPath()))); err == nil {
 			if m, err := config.ParseManifest(raw, name); err == nil {
 				oc.Runtime = m.Runtime
 				oc.Provision = m.Provision

@@ -86,6 +86,26 @@ func TestBlueGreenValidation(t *testing.T) {
 	}
 }
 
+func TestRootComponent(t *testing.T) {
+	yml := strings.Replace(graphRoot, "db:     { path: apps/db,     servers: [s1] }",
+		"db:     { path: ., servers: [s1] }", 1)
+	if _, err := ParseRoot([]byte(yml)); err == nil {
+		t.Error("root component without manifest must be rejected")
+	}
+	yml = strings.Replace(graphRoot, "db:     { path: apps/db,     servers: [s1] }",
+		"db:     { path: ., manifest: f1.db.yml, servers: [s1] }", 1)
+	r, err := ParseRoot([]byte(yml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Components["db"].ManifestPath(); got != "f1.db.yml" {
+		t.Errorf("root ManifestPath = %q", got)
+	}
+	if got := r.Components["api"].ManifestPath(); got != "apps/api/f1.yml" {
+		t.Errorf("subdir ManifestPath = %q", got)
+	}
+}
+
 func TestServerOSDefaults(t *testing.T) {
 	yml := strings.Replace(graphRoot, "s1: { host: h, user: u }", "s1: { host: h, user: u, os: windows }", 1)
 	r := mustParse(t, yml)

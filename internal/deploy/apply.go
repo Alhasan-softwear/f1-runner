@@ -110,7 +110,7 @@ func deployOne(layout release.Layout, repo *gitx.Repo, cfg *config.Root, state *
 		}
 	}
 
-	manifestRaw, err := repo.ShowFile(sha, comp.Path+"/f1.yml")
+	manifestRaw, err := repo.ShowFile(sha, comp.ManifestPath())
 	if err != nil {
 		return err
 	}
