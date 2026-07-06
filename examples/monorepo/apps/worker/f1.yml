@@ -1,0 +1,13 @@
+name: worker
+runtime: script
+
+scripts:
+  # `sh scripts/…` (not ./scripts/…) so the exec bit doesn't matter.
+  start: sh scripts/start.sh
+  stop: sh scripts/stop.sh
+  logs: tail -n 100 "$F1_LOG"
+
+health:
+  cmd: kill -0 "$(cat "$F1_SHARED/worker.pid")"
+  retries: 3
+  interval: 2s

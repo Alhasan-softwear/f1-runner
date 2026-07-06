@@ -1,0 +1,16 @@
+project: example
+repo: git@github.com:you/example.git   # the e2e harness rewrites this to a server-local path
+branch: main
+
+servers:
+  prod:
+    host: 1.2.3.4
+    user: deploy
+
+components:
+  web:
+    path: apps/web
+    servers: [prod]
+  worker:
+    path: apps/worker
+    servers: [prod]

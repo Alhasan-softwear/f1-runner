@@ -1,0 +1,10 @@
+name: web
+runtime: docker
+
+docker:
+  compose: docker-compose.yml
+
+health:
+  url: http://localhost:8080/
+  retries: 10
+  interval: 2s
